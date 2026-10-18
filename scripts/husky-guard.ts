@@ -36,10 +36,12 @@ export class HuskyPreCommitGuard {
 
   async runGuard(): Promise<GuardResult[]> {
     const results: GuardResult[] = [];
+    const executed = new Set<string>();
 
     for (const check of this.config.checks) {
       const result = await this.runCheck(check);
       results.push(result);
+      executed.add(check);
 
       if (!result.passed && this.config.failFast) {
         break;
@@ -47,7 +49,8 @@ export class HuskyPreCommitGuard {
     }
 
     this.results = results;
-    this.generateReport();
+    const skipped = this.config.checks.filter((check) => !executed.has(check));
+    this.generateReport(skipped);
 
     return results;
   }
@@ -97,7 +100,12 @@ export class HuskyPreCommitGuard {
     }
   }
 
-  private generateReport(): void {
+  private generateReport(skipped: string[] = []): void {
+    // Don't write a report when the guard is disabled: any caller invoking
+    // runGuard() directly (not just preCommit()) must not leave a report
+    // file behind describing a run that was never meant to count.
+    if (!this.config.enabled) return;
+
     const report = {
       timestamp: new Date().toISOString(),
       passed: this.results.every((r) => r.passed),
@@ -106,6 +114,7 @@ export class HuskyPreCommitGuard {
         total: this.results.length,
         passed: this.results.filter((r) => r.passed).length,
         failed: this.results.filter((r) => !r.passed).length,
+        skipped,
       },
     };
 

@@ -61,6 +61,7 @@ export const REAL_BACKEND_SKIP_REASON =
  */
 export const LOGIN_ERROR_CODES = {
 	invalidCredentials: "AUTH_INVALID_CREDENTIALS",
+	missingCredentials: "AUTH_MISSING_CREDENTIALS",
 	unauthorized: "AUTH_UNAUTHORIZED",
 	forbidden: "AUTH_FORBIDDEN",
 	rateLimited: "AUTH_RATE_LIMITED",
