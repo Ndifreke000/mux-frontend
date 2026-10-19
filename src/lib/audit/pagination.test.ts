@@ -3,6 +3,10 @@ import { MOCK_AUDIT_ENTRIES, MOCK_AUDIT_ENTRY_COUNT } from "./mock-entries";
 import {
 	type AuditEntry,
 	type AuditPageQuery,
+	DEFAULT_AUDIT_PAGE_SIZE,
+	MAX_AUDIT_PAGE_SIZE,
+	MAX_AUDIT_RANGE_DAYS,
+	MAX_CURSOR_LENGTH,
 	decodeAuditCursor,
 	encodeAuditCursor,
 	paginateAuditEntries,
@@ -91,6 +95,214 @@ describe("parseAuditPageParams", () => {
 		expect(parseAuditPageParams(toAuditSearchParams(result.query))).toEqual(
 			result,
 		);
+	});
+});
+
+describe("parseAuditPageParams rejection branches", () => {
+	const DAY_MS = 24 * 60 * 60 * 1000;
+
+	function expectRejected(
+		query: string,
+		field: string,
+		code: "invalid_filter" | "invalid_cursor" = "invalid_filter",
+	) {
+		const result = parse(query);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.code).toBe(code);
+		expect(result.field).toBe(field);
+	}
+
+	describe("parameter pollution", () => {
+		// Each value is valid on its own, so only the duplication can reject.
+		it.each([
+			["actor", "actor=a&actor=b"],
+			["action", "action=wallet.send&action=wallet.send"],
+			["from", "from=2026-01-01&from=2026-01-02"],
+			["to", "to=2026-01-01&to=2026-01-02"],
+			["cursor", "cursor=abc&cursor=def"],
+			["limit", "limit=1&limit=100"],
+		])("rejects a duplicated %s", (field, query) => {
+			expect(new URLSearchParams(query).getAll(field)).toHaveLength(2);
+			expectRejected(query, field);
+		});
+
+		it("rejects a duplicate even when the copies are identical or empty", () => {
+			expectRejected("limit=10&limit=10", "limit");
+			expectRejected("actor=&actor=", "actor");
+		});
+	});
+
+	describe("actor/action tokens", () => {
+		it.each([
+			["actor", "actor="],
+			["actor", "actor=a%09b"],
+			["actor", "actor=a%00b"],
+			["action", "action=wallet%7Fsend"],
+			["action", "action=wallet%0Asend"],
+			["action", `action=${"a".repeat(129)}`],
+		])("rejects a non-token %s (%s)", (field, query) => {
+			expectRejected(query, field);
+		});
+
+		it("accepts a 128-character token", () => {
+			const actor = "a".repeat(128);
+			expect(parse(`actor=${actor}`)).toMatchObject({
+				ok: true,
+				query: { filters: { actor } },
+			});
+		});
+	});
+
+	describe("from/to dates", () => {
+		it.each([
+			["from", "from=yesterday"],
+			["from", "from=01%2F02%2F2026"],
+			["from", "from=2026-1-01"],
+			["from", "from=2026-01-01T10%3A00"],
+			["to", "to=2026-01-01%2000%3A00%3A00Z"],
+			["to", "to="],
+		])("rejects malformed %s (%s)", (field, query) => {
+			expectRejected(query, field);
+		});
+
+		it.each([
+			["from", "from=2026-13-01"],
+			["from", "from=2026-00-10"],
+			["to", "to=2026-01-01T25%3A00Z"],
+			["to", "to=2026-01-01T00%3A61Z"],
+		])("rejects ISO-shaped but unparseable %s (%s)", (field, query) => {
+			expectRejected(query, field);
+		});
+
+		it("rejects an inverted range on the to field", () => {
+			expectRejected(
+				"from=2026-02-01T00%3A00%3A00Z&to=2026-01-31T23%3A59%3A59Z",
+				"to",
+			);
+		});
+
+		it("accepts a zero-length range", () => {
+			expect(parse("from=2026-01-01&to=2026-01-01").ok).toBe(true);
+		});
+
+		it(`accepts a range of exactly ${MAX_AUDIT_RANGE_DAYS} days`, () => {
+			const from = "2025-01-01T00:00:00.000Z";
+			const to = new Date(
+				Date.parse(from) + MAX_AUDIT_RANGE_DAYS * DAY_MS,
+			).toISOString();
+			expect(
+				parse(new URLSearchParams({ from, to }).toString()),
+			).toMatchObject({ ok: true, query: { filters: { from, to } } });
+		});
+
+		it(`rejects a range over ${MAX_AUDIT_RANGE_DAYS} days`, () => {
+			const from = "2025-01-01T00:00:00.000Z";
+			const to = new Date(
+				Date.parse(from) + MAX_AUDIT_RANGE_DAYS * DAY_MS + 1,
+			).toISOString();
+			expectRejected(new URLSearchParams({ from, to }).toString(), "to");
+		});
+	});
+
+	describe("limit", () => {
+		it("defaults when absent", () => {
+			const result = parse("actor=a");
+			expect(result).toMatchObject({
+				ok: true,
+				query: { limit: DEFAULT_AUDIT_PAGE_SIZE },
+			});
+		});
+
+		it.each(["", "abc", "-1", "1e2", "0x10", "%205", "1000"])(
+			"rejects non-numeric limit %j",
+			(raw) => {
+				expectRejected(`limit=${raw}`, "limit");
+			},
+		);
+
+		it.each(["0", "000", String(MAX_AUDIT_PAGE_SIZE + 1), "999"])(
+			"rejects out-of-range limit %s",
+			(raw) => {
+				expectRejected(`limit=${raw}`, "limit");
+			},
+		);
+
+		it.each([1, MAX_AUDIT_PAGE_SIZE])("accepts limit %i", (limit) => {
+			expect(parse(`limit=${limit}`)).toMatchObject({
+				ok: true,
+				query: { limit },
+			});
+		});
+	});
+
+	describe("cursor", () => {
+		it("defaults to null when absent", () => {
+			expect(parse("limit=5")).toMatchObject({
+				ok: true,
+				query: { cursor: null },
+			});
+		});
+
+		it(`rejects a cursor longer than ${MAX_CURSOR_LENGTH} characters`, () => {
+			expectRejected(
+				`cursor=${"a".repeat(MAX_CURSOR_LENGTH + 1)}`,
+				"cursor",
+				"invalid_cursor",
+			);
+		});
+
+		it(`accepts a cursor of exactly ${MAX_CURSOR_LENGTH} characters`, () => {
+			const cursor = "a".repeat(MAX_CURSOR_LENGTH);
+			expect(parse(`cursor=${cursor}`)).toMatchObject({
+				ok: true,
+				query: { cursor },
+			});
+		});
+
+		it.each(["abc+def", "abc/def", "abc=", "abc.def", "abc def", ""])(
+			"rejects non-base64url cursor %j",
+			(cursor) => {
+				expectRejected(
+					`cursor=${encodeURIComponent(cursor)}`,
+					"cursor",
+					"invalid_cursor",
+				);
+			},
+		);
+	});
+});
+
+describe("toAuditSearchParams", () => {
+	it("round-trips a fully populated valid query", () => {
+		const result = parse(
+			"actor=member_admin&action=wallet.send&from=2026-01-01&to=2026-02-01T12%3A30%3A00%2B01%3A00&cursor=eyJ2IjoxfQ&limit=25",
+		);
+		if (!result.ok) throw new Error("expected ok");
+
+		const params = toAuditSearchParams(result.query);
+		expect(Object.fromEntries(params)).toEqual({
+			actor: "member_admin",
+			action: "wallet.send",
+			from: "2026-01-01T00:00:00.000Z",
+			to: "2026-02-01T11:30:00.000Z",
+			cursor: "eyJ2IjoxfQ",
+			limit: "25",
+		});
+		expect(parseAuditPageParams(params)).toEqual(result);
+	});
+
+	it("omits absent filters and cursor but always serializes the limit", () => {
+		const query: AuditPageQuery = {
+			filters: {},
+			cursor: null,
+			limit: DEFAULT_AUDIT_PAGE_SIZE,
+		};
+		const params = toAuditSearchParams(query);
+		expect(Object.fromEntries(params)).toEqual({
+			limit: String(DEFAULT_AUDIT_PAGE_SIZE),
+		});
+		expect(parseAuditPageParams(params)).toEqual({ ok: true, query });
 	});
 });
 
